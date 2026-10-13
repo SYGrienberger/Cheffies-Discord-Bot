@@ -1,11 +1,13 @@
 # Cheffies Discord Bot: Architecture
 
 ## Context
-This is a Discord music bot. Each user saves their own YouTube Data API key with `/setkey`. `/play` searches YouTube with that key, so the user's quota pays for search. The bot then streams the audio into the user's voice channel through yt-dlp + FFmpeg; the Data API itself can't stream audio.
+Cheffies is a Discord music bot. Each user saves their own YouTube Data API key with `/setkey`. `/play` searches YouTube with that key, so searches use the user's quota. The bot then streams the audio into the user's voice channel through yt-dlp + FFmpeg; the Data API itself can't stream audio.
 
-Goals: **stable** (a single failure never takes the bot down) and **extensible** (adding a command, music source or storage backend means adding one file and touching no core code).
+Goals:
+- **Stable:** one failure (a bad track, a dropped connection, a broken command) never takes the bot down.
+- **Extensible:** adding a command, music source or storage backend means adding a file, without changing core code.
 
-Stack: Node 20 + TypeScript (strict), discord.js v14, @discordjs/voice, better-sqlite3, yt-dlp, ffmpeg-static, pino (logging), zod (validation), vitest (tests).
+Stack: Node 22 + TypeScript (strict), discord.js v14, @discordjs/voice, better-sqlite3, yt-dlp, ffmpeg-static, pino (logging), zod (config validation), vitest (tests), ESLint (type-aware).
 
 ---
 
@@ -13,116 +15,171 @@ Stack: Node 20 + TypeScript (strict), discord.js v14, @discordjs/voice, better-s
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  Discord layer      commands/, interactions/             │  thin: parse input, reply
+│  Discord layer      src/discord/, src/commands/          │  thin: parse input, call a service, reply
 ├──────────────────────────────────────────────────────────┤
 │  Services           KeyService, MusicService             │  business rules, no discord.js imports*
 ├──────────────────────────────────────────────────────────┤
-│  Ports (interfaces) KeyRepository, TrackSource,          │  contracts that core depends on
-│                     Cipher, AudioStreamer                │
+│  Ports (interfaces) KeyRepository, Cipher, TrackSource,  │  contracts the core depends on
+│                     ApiKeyValidator, AudioStreamer       │
 ├──────────────────────────────────────────────────────────┤
-│  Adapters           SqliteKeyRepository, YouTubeSource,  │  swappable implementations
-│                     AesGcmCipher, YtDlpStreamer          │
+│  Adapters           SqliteKeyRepository, AesGcmCipher,   │  swappable implementations
+│                     YouTubeApiClient, YouTubeSource,     │
+│                     YtDlpStreamer                        │
 └──────────────────────────────────────────────────────────┘
-        * except the voice/player module, which owns @discordjs/voice
+        * except src/music/, which owns @discordjs/voice
 ```
 
-Rule: dependencies point **downward, onto interfaces only**. `container.ts` wires concrete adapters in one place, so swapping SQLite for Postgres or adding SoundCloud only touches that file.
+Rule: dependencies point **downward, onto interfaces only**. `src/container.ts` is the only file that picks concrete adapters, so swapping SQLite for Postgres or adding SoundCloud only touches that file.
 
 ## 2. Folder layout
 
 ```
 src/
-  index.ts                  entry: load config → build container → start bot → shutdown hooks
-  config.ts                 zod-validated env (fails fast at boot with clear errors)
-  container.ts              composition root: creates every adapter/service once
+  index.ts                  entry: env → config → container → commands → Discord client → login
+  config.ts                 zod-validated env; lists every problem at once and exits
+  container.ts              composition root: builds every adapter and service once
+  lifecycle.ts              SIGINT/SIGTERM graceful shutdown, unhandled-error logging
   core/
-    logger.ts               pino, with a redaction list (apiKey, token, encKey)
-    errors.ts               AppError hierarchy: UserError, KeyMissingError, QuotaError, SourceError…
-    types.ts                Track, TrackRequest, shared types
-  ports/                    interfaces only (no implementations)
-    KeyRepository.ts        get(userId) / set(userId, enc) / delete(userId)
-    Cipher.ts               encrypt(plain) / decrypt(enc)
-    TrackSource.ts          id, canHandle(input), resolve(input, ctx) → Track[]
-    AudioStreamer.ts        createStream(track) → Readable
+    errors.ts               AppError → UserError (shown to users) and its subclasses
+    logger.ts               pino with secret redaction (apiKey, key, token, ...)
+    types.ts                TrackInfo, Track, ResolveContext
+  ports/                    interfaces only
+    KeyRepository.ts  Cipher.ts  ApiKeyValidator.ts  TrackSource.ts  AudioStreamer.ts
   adapters/
-    storage/SqliteKeyRepository.ts  (+ migrations/ with numbered .sql files)
     crypto/AesGcmCipher.ts
-    sources/youtube/YouTubeApiClient.ts   raw HTTP, retries, error mapping
-    sources/youtube/YouTubeSource.ts      implements TrackSource
-    streaming/YtDlpStreamer.ts
+    storage/database.ts             opens SQLite (WAL) and runs migrations
+    storage/migrations.ts           append-only list, tracked with PRAGMA user_version
+    storage/SqliteKeyRepository.ts
+    sources/youtube/parse.ts        URL/duration parsing (pure functions)
+    sources/youtube/YouTubeApiClient.ts  HTTP, timeouts, retry, error mapping; also the key validator
+    sources/youtube/YouTubeSource.ts     TrackSource for links, playlists and search
+    streaming/YtDlpStreamer.ts      spawns yt-dlp, waits for the first audio bytes
   services/
     KeyService.ts           save (validate → encrypt → store), getKey, remove, status
-    MusicService.ts         picks the TrackSource, enqueues, delegates to GuildPlayer
+    MusicService.ts         picks a source, resolves, connects, enqueues; playback controls
+    index.ts                the Services bag that commands receive
   music/
-    GuildPlayer.ts          one per guild: queue + AudioPlayer + VoiceConnection state machine
-    PlayerRegistry.ts       Map<guildId, GuildPlayer>, lazy create, cleanup on destroy
-    Queue.ts                pure data structure (easy to unit-test; future shuffle/loop)
+    Queue.ts                bounded FIFO queue (pure, unit-tested)
+    GuildPlayer.ts          one per guild: queue + AudioPlayer + VoiceConnection
+    PlayerRegistry.ts       Map<guildId, GuildPlayer>, created lazily, removed when destroyed
+    types.ts                MusicPlayer / PlayerLookup interfaces (what services see)
   discord/
-    client.ts               Client creation, intents (Guilds, GuildVoiceStates)
-    Command.ts              interface Command { data, execute(ctx) } + optional modal/button handlers
-    commandLoader.ts        auto-discovers commands/*.ts, so a new command is just a new file
-    interactionRouter.ts    routes slash/modal/button by customId; global try/catch → error replies
-    guards.ts               reusable checks: requireVoiceChannel, requireKey, cooldown
+    Command.ts              Command contract, defineCommand(), customId()
+    commandLoader.ts        auto-discovers src/commands/**
+    interactionRouter.ts    routes slash/modal/component events; the error boundary
+    guards.ts               requireGuild, requireVoiceChannel, requireSameChannelAsBot
+    cooldowns.ts            per-user command cooldowns
+    announcer.ts            posts "now playing" / skipped / left messages
+    voiceStateHandler.ts    detects an empty channel and tells the player
+    format.ts               durations, safe track links
+    client.ts               intents: Guilds + GuildVoiceStates only
   commands/
-    key/setkey.ts  key/removekey.ts  key/keystatus.ts
-    music/play.ts  skip.ts  stop.ts  pause.ts  resume.ts  queue.ts  nowplaying.ts
+    key/    setkey  removekey  keystatus
+    music/  play  skip  stop  pause  resume  shuffle  queue  nowplaying
   scripts/deploy-commands.ts
-tests/                       mirrors src/ (unit tests on services, Queue, adapters with fakes)
+tests/                      unit tests for every layer except live voice
 ```
 
 ## 3. Extension points
 
-| You want to add…        | You do…                                                                 |
-|-------------------------|-------------------------------------------------------------------------|
-| A slash command         | Add `src/commands/<group>/<name>.ts` exporting a `Command`. The loader picks it up. |
-| A music source (Spotify, SoundCloud) | Implement `TrackSource`, then register it in `container.ts`. `MusicService` uses the first source whose `canHandle` matches. |
-| A different database    | Implement `KeyRepository`, then swap it in `container.ts`.               |
-| A per-guild setting (DJ role, volume) | Add a `GuildSettingsRepository` port + a migration file, following the same pattern. |
-| Buttons on "Now playing" | Give the command a `components` handler. The router dispatches on a `customId` prefix (`music:skip`). |
-
-The `TrackSource.resolve` context carries `{ userId, apiKey? }`, so any future per-user credential works the same way the YouTube key does.
+| You want to add… | You do… |
+|---|---|
+| A slash command | Add `src/commands/<group>/<name>.ts` with `export default defineCommand({...})`, then run `npm run deploy`. The loader finds it automatically. |
+| A modal or button | Use `customId('<command>', '<action>')` and implement `handleModal` / `handleComponent` on that command. The router dispatches on the prefix. |
+| A music source (SoundCloud, Spotify, ...) | Implement `TrackSource` in `src/adapters/sources/<name>/`, then add it to the `sources` array in `container.ts`, **before** YouTube (YouTube catches all plain-text searches). |
+| A per-user credential for a new source | Add a field to `ResolveContext` and look it up in `MusicService.play`, the same way the YouTube key is. |
+| A different database | Implement `KeyRepository`, then swap it in `container.ts`. |
+| A new table or setting | Append a SQL string to `migrations.ts` (never edit old entries), then add a port + repository following `KeyRepository`. |
+| A new service | Create it in `container.ts` and add it to `Services` in `services/index.ts`. |
+| Loop / remove / move in the queue | Add the operation to `Queue.ts` (pure and testable), expose it on `MusicPlayer`/`GuildPlayer`, and add a command. |
 
 ## 4. Key flow (per-user YouTube key)
 
 ```
-/setkey → Modal (key never appears in chat)
+/setkey → modal (the key never appears in chat)
   → KeyService.save(userId, key)
-      → YouTubeApiClient.validate(key)   1 quota unit; maps 400/403 → InvalidKey / ApiNotEnabled / Quota
-      → Cipher.encrypt(key)              AES-256-GCM, random IV, auth tag; ENCRYPTION_KEY from env
-      → KeyRepository.set(userId, enc)
-  → ephemeral "Saved ✓ (…abcd)"
+      → format check                      (no API call for obvious junk)
+      → YouTubeApiClient.validate(key)    videos.list, 1 quota unit
+          400 key invalid       → InvalidKeyError
+          403 quotaExceeded     → QuotaExceededError
+          403 SERVICE_DISABLED  → ApiNotEnabledError ("enable YouTube Data API v3")
+          403 key restricted    → InvalidKeyError ("set Application restrictions to None")
+      → AesGcmCipher.encrypt(key)         AES-256-GCM, random IV, auth tag, "v1." prefix
+      → KeyRepository.set(userId, encrypted)
+  → ephemeral "✅ Key saved (••••••abcd)"
 ```
-`/keystatus` shows the key masked. `/removekey` deletes it. Every key-related reply is ephemeral, and the logger redacts keys.
+
+- `/keystatus` shows the key masked. `/removekey` deletes it. Every reply about a key is ephemeral.
+- If a stored key can't be decrypted (because `ENCRYPTION_KEY` changed), it is deleted and the user is asked to run `/setkey` again.
+- Request URLs contain the key, so they are never logged or put into errors. The logger also redacts key-like fields.
 
 ## 5. Play flow
 
 ```
 /play <query|url>
-  guards: in voice channel → user has key (else hint to /setkey)
-  → MusicService.request(guildId, userId, input)
-      → source = sources.find(canHandle)  → resolve() → Track[]  (playlists capped at 50)
-      → PlayerRegistry.get(guildId).enqueue(tracks)
-  GuildPlayer: Idle → join → stream next via AudioStreamer → Playing → (Idle → next | empty → idle timer)
+  requireGuild → requireVoiceChannel (incl. Connect/Speak permission) → deferReply
+  → MusicService.play
+      → source = first TrackSource whose canHandle(query)
+      → apiKey = KeyService.getKey(user)        (KeyMissingError → "run /setkey")
+      → source.resolve(query, { userId, apiKey })
+           video link → videos.list   ·  playlist → playlistItems (capped) + videos.list
+           search     → search.list (5 results) + videos.list, first playable one
+      → (only now) PlayerRegistry.getOrCreate(guild).connect(voice)
+      → player.enqueue(tracks tagged with requestedBy)
+  → reply "▶️ Starting …" / "➕ Queued … at #n"
+
+GuildPlayer:
+  enqueue → playNext → AudioStreamer.createStream → demuxProbe → AudioPlayer.play
+  Idle → next track …  queue empty → idle timer → leave
 ```
 
 ## 6. Stability measures
-- **Fail fast at boot**: invalid env, a missing ffmpeg/yt-dlp binary or a DB that won't open aborts with a clear message.
-- **Error boundary**: `interactionRouter` wraps every handler. `UserError`s become friendly ephemeral replies. Unknown errors are logged with an id and the user sees "Something went wrong (ref: X)". Commands defer early to avoid Discord's 3-second timeout.
-- **Isolation per guild**: a crash in one `GuildPlayer` (a stream error, for example) skips that track or resets that guild only. Each player listens to its own `error` events.
-- **Voice resilience**: on `Disconnected` the player tries to reconnect within 5s, and destroys and cleans up if that fails. It auto-leaves after 5 minutes idle or when the channel is empty.
-- **External calls**: the YouTube client uses timeouts + one retry with backoff on 5xx. Quota errors aren't retried.
-- **Process level**: `unhandledRejection`/`uncaughtException` are logged. On SIGINT/SIGTERM the bot shuts down gracefully (destroys voice connections, closes the DB, logs out).
-- **Data**: SQLite in WAL mode, plus versioned migrations run at startup.
-- **Rate limiting**: a small per-user cooldown on `/play` and `/setkey`.
 
-## 7. Configuration (`.env.example`)
-`DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DEV_GUILD_ID` (optional, for fast command deploys), `ENCRYPTION_KEY` (`openssl rand -base64 32`), `DB_PATH=./data/bot.db`, `LOG_LEVEL=info`.
+- **Fail fast at boot.** Invalid env (all problems listed at once), a missing yt-dlp, a missing FFmpeg, or a database from a newer build each stop the bot at startup with a clear message.
+- **Single error boundary.** `interactionRouter` catches everything:
+  - A `UserError` becomes a private reply.
+  - Any other error is logged with a short reference id, and the user sees "Something went wrong (ref: abcd1234)".
+  - A deferred public reply is replaced by a private error message.
+  - A failing error reply (for example, an expired interaction) is logged and swallowed.
+- **Validate before side effects.** `/play` resolves the query before joining voice, so a typo or a missing key never makes the bot join a channel for nothing. `/setkey` validates the key before storing it.
+- **Per-guild isolation.** Each `GuildPlayer` owns its own queue, audio player and connection:
+  - A track that fails to start is announced and skipped.
+  - A playback error moves on to the next track.
+  - A lost connection destroys only that guild's player, and the registry makes a fresh one on the next `/play`.
+- **No silent tracks.** `YtDlpStreamer` waits for the first audio bytes (30s timeout). A yt-dlp failure rejects with yt-dlp's own message, and a no-op `error` listener keeps late stream errors from crashing the process.
+- **Voice resilience.**
+  - After a disconnect, the player waits up to 5s for the connection to start reconnecting, then gives up and leaves.
+  - It leaves after `IDLE_TIMEOUT_SECONDS` with an empty queue or nobody listening.
+  - It connects with `selfDeaf` set.
+- **External calls.** The YouTube client uses a 10s timeout and retries once on network errors or 5xx responses. Quota and key errors are never retried. API errors become specific, actionable messages.
+- **Process level.**
+  - SIGINT/SIGTERM trigger a graceful shutdown: leave voice, close the database, log out, with a 10s forced-exit fallback.
+  - `unhandledRejection` is logged.
+  - `uncaughtException` triggers a clean exit, and Docker's `restart: unless-stopped` brings the bot back.
+- **Data.** SQLite runs in WAL mode with a busy timeout and transactional, versioned migrations.
+- **Abuse limits.** There are per-user cooldowns (`/play` 3s, `/setkey` 5s), plus a queue cap (`MAX_QUEUE_LENGTH`) and a playlist cap (`MAX_PLAYLIST_ITEMS`).
+- **Static checks.** TypeScript runs in strict mode with `noUncheckedIndexedAccess`. ESLint enforces `no-floating-promises` and `no-misused-promises`, which catch the unawaited promises that most often cause silent failures in bots.
 
-## 8. Docs
-- `README.md`: setup, Discord app + invite scopes, getting a YouTube API key, run/deploy.
-- `docs/ARCHITECTURE.md`: this document, with the diagrams above and the "how to extend" table.
+## 7. Configuration
 
-## 9. Testing strategy
-- `npm run build` (tsc strict), `npm run lint`, and `npm test`. Tests cover the cipher round-trip/tamper check, the repository on `:memory:`, KeyService with a fake client, the Queue, source selection in MusicService, and the router error boundary.
-- Manual smoke test: deploy commands → invalid key rejected → valid key saved → `/play` in voice → `/queue` `/skip` `/stop` → `/removekey` → `/play` asks for the key again.
+See `.env.example`.
 
+- **Required:** `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `ENCRYPTION_KEY` (`openssl rand -base64 32`).
+- **Optional:** `DEV_GUILD_ID`, `DB_PATH`, `LOG_LEVEL`, `YTDLP_PATH`, `YTDLP_EXTRA_ARGS`, `IDLE_TIMEOUT_SECONDS`, `MAX_PLAYLIST_ITEMS`, `MAX_QUEUE_LENGTH`.
+
+## 8. Testing strategy
+
+- `npm run typecheck`, `npm run lint`, `npm test`, and `npm run build` all run in CI (`.github/workflows/ci.yml`).
+- Unit tests cover:
+  - config validation
+  - the cipher (round-trip, tampering, wrong key)
+  - the SQLite repository and migrations
+  - KeyService (with a fake validator)
+  - YouTube URL and duration parsing
+  - API client error mapping and retries (with a fake `fetch`)
+  - YouTubeSource
+  - the Queue
+  - MusicService (with fake sources and player)
+  - the router's error boundary and cooldowns
+  - command discovery
+- `GuildPlayer` (live voice) is covered by the manual smoke test: deploy commands → invalid key rejected → valid key saved → `/play` in voice → `/queue` `/skip` `/pause` `/resume` `/stop` → `/removekey` → `/play` asks for a key again.
